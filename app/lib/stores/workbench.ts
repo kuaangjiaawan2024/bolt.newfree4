@@ -12,6 +12,7 @@ import { TerminalStore } from './terminal';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import { Octokit } from "@octokit/rest";
+import type { ReposGetResponseData, ReposCreateForAuthenticatedUserResponseData } from "@octokit/types";
 
 export interface ArtifactState {
   id: string;
@@ -351,18 +352,21 @@ export class WorkbenchStore {
       const octokit = new Octokit({ auth: githubToken });
   
       // Check if the repository already exists before creating it
-      let repo
+      let repo: ReposGetResponseData | ReposCreateForAuthenticatedUserResponseData | undefined
       try {
-        repo = await octokit.repos.get({ owner: owner, repo: repoName });
+        const { data: existingRepo } = await octokit.repos.get({ owner: owner, repo: repoName });
+      repo = existingRepo as ReposGetResponseData;
+
+      if (!repo?.owner) throw new Error('Invalid repository response');
       } catch (error) {
         if (error instanceof Error && 'status' in error && error.status === 404) {
-          // Repository doesn't exist, so create a new one
-          const { data: newRepo } = await octokit.repos.createForAuthenticatedUser({
+
+          const { data: createdRepo } = await octokit.repos.createForAuthenticatedUser({
             name: repoName,
             private: false,
             auto_init: true,
           });
-          repo = newRepo;
+          repo = createdRepo as ReposCreateForAuthenticatedUserResponseData;
         } else {
           console.log('cannot create repo!');
           throw error; // Some other error occurred
@@ -379,12 +383,18 @@ export class WorkbenchStore {
       const blobs = await Promise.all(
         Object.entries(files).map(async ([filePath, dirent]) => {
           if (dirent?.type === 'file' && dirent.content) {
-            const { data: blob } = await octokit.git.createBlob({
-              owner: repo.owner.login,
-              repo: repo.name,
-              content: Buffer.from(dirent.content).toString('base64'),
-              encoding: 'base64',
-            });
+            const content = Buffer.from(
+            typeof dirent.content === 'string' 
+              ? dirent.content 
+              : (dirent.content as Buffer).toString('utf8')
+          ).toString('base64');
+          
+          const { data: blob } = await octokit.git.createBlob({
+            owner: repo?.owner?.login || '',
+            repo: repo?.name || repoName,
+            content: content,
+            encoding: 'base64',
+          });
             return { path: filePath.replace(/^\/home\/project\//, ''), sha: blob.sha };
           }
         })
@@ -398,16 +408,16 @@ export class WorkbenchStore {
   
       // Get the latest commit SHA (assuming main branch, update dynamically if needed)
       const { data: ref } = await octokit.git.getRef({
-        owner: repo.owner.login,
-        repo: repo.name,
-        ref: `heads/${repo.default_branch || 'main'}`, // Handle dynamic branch
+        owner: repo?.owner?.login || '',
+        repo: repo?.name || repoName,
+        ref: `heads/${repo?.default_branch ?? 'main'}`,
       });
       const latestCommitSha = ref.object.sha;
   
       // Create a new tree
       const { data: newTree } = await octokit.git.createTree({
-        owner: repo.owner.login,
-        repo: repo.name,
+        owner: repo?.owner?.login || '',
+        repo: repo?.name || repoName,
         base_tree: latestCommitSha,
         tree: validBlobs.map((blob) => ({
           path: blob!.path,
@@ -419,8 +429,8 @@ export class WorkbenchStore {
   
       // Create a new commit
       const { data: newCommit } = await octokit.git.createCommit({
-        owner: repo.owner.login,
-        repo: repo.name,
+        owner: repo?.owner?.login || '',
+        repo: repo?.name || repoName,
         message: 'Initial commit from your app',
         tree: newTree.sha,
         parents: [latestCommitSha],
@@ -428,15 +438,18 @@ export class WorkbenchStore {
   
       // Update the reference
       await octokit.git.updateRef({
-        owner: repo.owner.login,
-        repo: repo.name,
-        ref: `heads/${repo.default_branch || 'main'}`, // Handle dynamic branch
+        owner: repo?.owner?.login || '',
+        repo: repo?.name || repoName,
+        ref: `heads/${repo?.default_branch ?? 'main'}`,
         sha: newCommit.sha,
       });
-  
-      alert(`Repository created and code pushed: ${repo.html_url}`);
+
+      console.log('Successfully pushed to GitHub:', repo.html_url);
+          alert(`代码已成功推送至GitHub仓库: ${repo.html_url}\n分支: ${repo.default_branch}`);
     } catch (error) {
-      console.error('Error pushing to GitHub:', error instanceof Error ? error.message : String(error));
+      console.error('GitHub推送错误:', error);
+      alert(`推送失败: ${error instanceof Error ? error.message : '未知错误'}`);
+      throw new Error('GitHub同步失败');
     }
   }
 }
